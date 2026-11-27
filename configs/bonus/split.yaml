@@ -1,0 +1,6 @@
+# Data preparation settings for the ArSarcasm-v2 bonus work.
+seed: 42
+validation_fraction: 0.1
+train_file: data/raw/arsarcasm_v2/training_data.csv
+test_file: data/raw/arsarcasm_v2/testing_data.csv
+output_dir: data/splits/arsarcasm_v2

@@ -197,6 +197,29 @@ def marker_breakdown(
     return pd.DataFrame(records)
 
 
+def token_statistics(
+    frame: pd.DataFrame,
+    text_column: str,
+    tokenizer,
+    max_length: int = 256,
+) -> dict:
+    """Return token-limit, length, and tokens-per-word statistics for one split."""
+    text = frame[text_column].astype(str)
+    lengths = tokenizer_lengths(text.tolist(), tokenizer)
+    word_counts = text.str.split().str.len().to_numpy()
+    summary = summarize_token_lengths(lengths, max_length=max_length)
+    summary["mean_tokens"] = float(lengths.mean()) if len(lengths) else 0.0
+    summary["mean_words"] = float(word_counts.mean()) if len(word_counts) else 0.0
+    per_tweet_ratio = lengths[word_counts > 0] / word_counts[word_counts > 0]
+    summary["mean_tweet_tokens_per_word"] = (
+        float(per_tweet_ratio.mean()) if len(per_tweet_ratio) else 0.0
+    )
+    summary["tokens_per_word"] = (
+        float(lengths.sum() / word_counts.sum()) if word_counts.sum() else 0.0
+    )
+    return summary
+
+
 def duplicate_summary(frame: pd.DataFrame, text_column: str = "tweet") -> dict:
     """Count exact duplicate rows and duplicate tweets (ignoring other columns)."""
     return {
