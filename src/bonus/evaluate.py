@@ -123,10 +123,14 @@ def evaluate_model_on_csv_with_predictions(
     if any(label not in LABEL_TO_ID.values() for label in labels):
         raise ValueError("Evaluation CSV contains a label outside the fixed mapping")
     dataset = _TextDataset(frame, tokenizer, max_length)
+    # DataLoader iterator creation draws a base seed; isolate it from training RNG.
+    evaluation_generator = torch.Generator()
+    evaluation_generator.manual_seed(0)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
+        generator=evaluation_generator,
         collate_fn=lambda rows: _pad_batch(rows, tokenizer),
     )
     device = torch.device(device)
