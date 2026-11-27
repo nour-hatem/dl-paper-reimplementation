@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
+import tempfile
 import time
 from typing import Any
 
@@ -16,7 +18,10 @@ import yaml
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer
 
-from .evaluate import calculate_metrics
+from .evaluate import (
+    calculate_metrics,
+    evaluate_model_on_csv_with_predictions,
+)
 from .model import build_model
 from .utils import capture_rng_state, restore_rng_state, set_seed
 
@@ -52,6 +57,9 @@ def _collate_batch(rows: list[dict[str, Any]], tokenizer: Any) -> dict[str, torc
 
 
 def _read_frame(csv_path: str | Path, max_samples: int | None = None) -> pd.DataFrame:
+    path_text = str(csv_path).replace("\\", "/").rstrip("/")
+    if path_text.rsplit("/", 1)[-1].lower() == "test.csv":
+        raise ValueError("Training is not allowed to read a file named test.csv")
     frame = pd.read_csv(csv_path)
     if not {"text", "label"}.issubset(frame.columns):
         raise ValueError(f"CSV must contain 'text' and 'label' columns: {csv_path}")
@@ -108,6 +116,91 @@ def _load_checkpoint(path: Path) -> dict[str, Any]:
         return torch.load(path, map_location="cpu")
 
 
+def _save_checkpoint_atomic(payload: dict[str, Any], path: Path) -> None:
+    """Atomically replace a checkpoint using a temporary file beside it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _write_predictions_atomic(predictions: pd.DataFrame, path: Path) -> None:
+    """Atomically write validation predictions beside the destination."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        predictions.to_csv(temporary_path, index=False)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _git_commit_hash() -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _write_or_verify_config_snapshot(
+    run_dir: Path,
+    config: dict[str, Any],
+    *,
+    train_path: Path,
+    validation_path: Path,
+    total_epochs: int,
+    max_train_samples: int | None,
+    max_validation_samples: int | None,
+    selected_device: torch.device,
+    resume: bool,
+) -> None:
+    snapshot = {
+        "git_commit_hash": _git_commit_hash(),
+        "config": json.loads(json.dumps(config, default=str)),
+        "resolved": {
+            "train_csv": str(train_path.resolve()),
+            "validation_csv": str(validation_path.resolve()),
+            "output_dir": str(run_dir.resolve()),
+            "epochs": total_epochs,
+            "max_train_samples": max_train_samples,
+            "max_validation_samples": max_validation_samples,
+            "device": str(selected_device),
+            "seed": int(config["training"]["seed"]),
+        },
+    }
+    snapshot_path = run_dir / "config.json"
+    if resume and snapshot_path.exists():
+        existing = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        if existing != snapshot:
+            raise ValueError(
+                "Run configuration does not match the saved config.json; "
+                "refusing to resume with a mismatched config."
+            )
+    elif resume:
+        print(
+            f"No config snapshot exists at {snapshot_path}; the earlier run "
+            "cannot be verified. Recording the current config for this resume."
+        )
+    snapshot_path.write_text(
+        json.dumps(snapshot, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def run_training(
     config: dict[str, Any] | str | Path,
     *,
@@ -133,6 +226,10 @@ def run_training(
     data_cfg = cfg["data"]
     model_cfg = cfg["model"]
     train_cfg = cfg["training"]
+    if train_cfg.get("scheduler") is not None:
+        raise ValueError("scheduler must be null; scheduler support is not implemented")
+    if train_cfg.get("warmup_steps", 0) != 0:
+        raise ValueError("warmup_steps must be 0; warmup support is not implemented")
     paths_cfg = cfg.get("paths", {})
     train_path = Path(train_csv or data_cfg["train_file"])
     validation_path = Path(validation_csv or data_cfg["validation_file"])
@@ -143,9 +240,20 @@ def run_training(
         raise ValueError("epochs must be at least 1")
 
     seed = int(train_cfg["seed"])
+    selected_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    _write_or_verify_config_snapshot(
+        run_dir,
+        cfg,
+        train_path=train_path,
+        validation_path=validation_path,
+        total_epochs=total_epochs,
+        max_train_samples=max_train_samples,
+        max_validation_samples=max_validation_samples,
+        selected_device=selected_device,
+        resume=resume,
+    )
     set_seed(seed)
     torch.use_deterministic_algorithms(True, warn_only=True)
-    selected_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     tokenizer = AutoTokenizer.from_pretrained(model_cfg["name"])
     train_frame = _read_frame(train_path, max_train_samples)
     validation_frame = _read_frame(validation_path, max_validation_samples)
@@ -261,10 +369,27 @@ def run_training(
             loader_generator=loader_generator,
             scaler=scaler,
         )
-        torch.save(payload, last_checkpoint)
         if improved:
-            torch.save(payload, run_dir / "checkpoint_best.pt")
+            best_checkpoint = run_dir / "checkpoint_best.pt"
+            _save_checkpoint_atomic(payload, best_checkpoint)
+        if improved:
+            _, validation_predictions = evaluate_model_on_csv_with_predictions(
+                model,
+                tokenizer,
+                validation_path,
+                batch_size=int(train_cfg["batch_size"]),
+                max_length=int(train_cfg["max_length"]),
+                device=selected_device,
+                max_samples=max_validation_samples,
+            )
+            _write_predictions_atomic(
+                validation_predictions,
+                run_dir / "validation_predictions.csv",
+            )
         _write_history(run_dir / "history.csv", history)
+        # The last checkpoint is the epoch commit marker: publish it only after
+        # all artifacts for this completed epoch have been written.
+        _save_checkpoint_atomic(payload, last_checkpoint)
         print(
             f"epoch {epoch_number}/{total_epochs}: "
             f"train_loss={train_metrics['loss']:.4f} "
@@ -312,6 +437,51 @@ def _write_history(path: Path, history: list[dict[str, Any]]) -> None:
     pd.DataFrame(history, columns=columns).to_csv(path, index=False)
 
 
+def generate_validation_predictions_from_checkpoint(
+    config: dict[str, Any] | str | Path = "configs/bonus/repro_arabertv02_base.yaml",
+    *,
+    output_dir: str | Path | None = None,
+    output_csv: str | Path | None = None,
+    device: str | None = None,
+) -> dict[str, Any]:
+    """Write validation predictions from an existing best checkpoint only."""
+    if isinstance(config, (str, Path)):
+        with Path(config).open("r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle)
+    cfg = config
+    model_cfg = cfg["model"]
+    training_cfg = cfg["training"]
+    data_cfg = cfg["data"]
+    paths_cfg = cfg.get("paths", {})
+    run_dir = Path(output_dir or paths_cfg["output_dir"])
+    checkpoint_path = run_dir / "checkpoint_best.pt"
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Best checkpoint not found: {checkpoint_path}")
+
+    selected_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    tokenizer = AutoTokenizer.from_pretrained(model_cfg["name"])
+    bundle = build_model(
+        model_cfg["name"],
+        int(model_cfg["num_labels"]),
+        architecture=model_cfg.get("architecture", "sequence_classification"),
+        loss=model_cfg.get("loss", "cross_entropy"),
+    )
+    model = bundle.model.to(selected_device)
+    checkpoint = _load_checkpoint(checkpoint_path)
+    model.load_state_dict(checkpoint["model_state"])
+    metrics, predictions = evaluate_model_on_csv_with_predictions(
+        model,
+        tokenizer,
+        data_cfg["validation_file"],
+        batch_size=int(training_cfg["batch_size"]),
+        max_length=int(training_cfg["max_length"]),
+        device=selected_device,
+    )
+    predictions_path = Path(output_csv or run_dir / "validation_predictions.csv")
+    _write_predictions_atomic(predictions, predictions_path)
+    return {"metrics": metrics, "predictions_csv": str(predictions_path)}
+
+
 def run_smoke_checks(config_path: str | Path, output_root: str | Path) -> dict[str, Any]:
     """Run the requested fast CPU checks without consulting held-out data."""
     from .evaluate import calculate_metrics
@@ -351,6 +521,14 @@ def run_smoke_checks(config_path: str | Path, output_root: str | Path) -> dict[s
 
     pd.read_csv = guarded_read_csv
     try:
+        try:
+            _read_frame(root / "test.csv")
+        except ValueError as exc:
+            if "test.csv" not in str(exc):
+                raise
+        else:
+            raise AssertionError("_read_frame did not reject a path named test.csv")
+
         history_a = run_training(
             config,
             output_dir=root / "same_seed_a",
@@ -371,6 +549,14 @@ def run_smoke_checks(config_path: str | Path, output_root: str | Path) -> dict[s
         )
         if not history_a.equals(history_b):
             raise AssertionError("Two CPU training runs with the same seed differed")
+        uninterrupted = run_training(
+            config,
+            output_dir=root / "uninterrupted_two_epochs",
+            max_train_samples=200,
+            max_validation_samples=200,
+            epochs=2,
+            device="cpu",
+        )
         resumed = run_training(
             config,
             output_dir=root / "same_seed_a",
@@ -382,6 +568,14 @@ def run_smoke_checks(config_path: str | Path, output_root: str | Path) -> dict[s
         )
         if resumed["epoch"].tolist() != [1, 2] or resumed["epoch"].duplicated().any():
             raise AssertionError("Resume created duplicate or unexpected history epochs")
+        resumed_epoch_two = resumed.loc[resumed["epoch"] == 2].reset_index(drop=True)
+        uninterrupted_epoch_two = uninterrupted.loc[
+            uninterrupted["epoch"] == 2
+        ].reset_index(drop=True)
+        if not resumed_epoch_two.equals(uninterrupted_epoch_two):
+            raise AssertionError(
+                "Resumed epoch 2 metrics differed from uninterrupted CPU training"
+            )
     finally:
         pd.read_csv = original_read_csv
 
@@ -391,6 +585,11 @@ def run_smoke_checks(config_path: str | Path, output_root: str | Path) -> dict[s
     }
     if set(read_paths) - allowed:
         raise AssertionError(f"Training read an unexpected CSV: {set(read_paths) - allowed}")
+    test_csv_reads = sum(
+        Path(read_path).name.lower() == "test.csv" for read_path in read_paths
+    )
+    if test_csv_reads != 0:
+        raise AssertionError(f"Training read test.csv {test_csv_reads} time(s)")
     ignored = subprocess.run(
         ["git", "check-ignore", "-q", str(root / "same_seed_a" / "checkpoint_best.pt")],
         check=False,
@@ -407,7 +606,9 @@ def run_smoke_checks(config_path: str | Path, output_root: str | Path) -> dict[s
         "runs": 2,
         "resume_history_epochs": resumed["epoch"].tolist(),
         "same_seed_histories_identical": True,
-        "test_csv_reads": 0,
+        "resume_epoch_two_matches_uninterrupted": True,
+        "uninterrupted_history_epochs": uninterrupted["epoch"].tolist(),
+        "test_csv_reads": test_csv_reads,
         "git_ignored_checkpoint": True,
         "hand_metrics": measured,
         "sample_run_metrics": history_a.iloc[0].to_dict(),

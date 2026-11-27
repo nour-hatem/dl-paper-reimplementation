@@ -86,9 +86,39 @@ def evaluate_model_on_csv(
     device: str | torch.device,
 ) -> dict[str, Any]:
     """Evaluate a model on a labeled CSV using dynamic per-batch padding."""
+    metrics, _ = evaluate_model_on_csv_with_predictions(
+        model,
+        tokenizer,
+        csv_path,
+        batch_size=batch_size,
+        max_length=max_length,
+        device=device,
+    )
+    return metrics
+
+
+def evaluate_model_on_csv_with_predictions(
+    model: torch.nn.Module,
+    tokenizer: Any,
+    csv_path: str | Path,
+    *,
+    batch_size: int,
+    max_length: int,
+    device: str | torch.device,
+    max_samples: int | None = None,
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Evaluate a labeled CSV and return metrics plus one prediction per row.
+
+    Row indices are zero-based positions in the CSV, before any sample limit.
+    """
     frame = pd.read_csv(csv_path)
     if not {"text", "label"}.issubset(frame.columns):
         raise ValueError("Evaluation CSV must contain 'text' and 'label' columns")
+    frame = frame[["text", "label"]].copy()
+    if max_samples is not None:
+        frame = frame.iloc[:max_samples].copy()
+    if frame.empty:
+        raise ValueError("Evaluation CSV has no rows to use")
     labels = frame["label"].astype(int).tolist()
     if any(label not in LABEL_TO_ID.values() for label in labels):
         raise ValueError("Evaluation CSV contains a label outside the fixed mapping")
@@ -108,7 +138,15 @@ def evaluate_model_on_csv(
             batch = {key: value.to(device) for key, value in batch.items()}
             output = model(**{key: value for key, value in batch.items() if key != "labels"})
             predictions.extend(output.logits.argmax(dim=-1).cpu().tolist())
-    return calculate_metrics(labels, predictions)
+    metrics = calculate_metrics(labels, predictions)
+    prediction_frame = pd.DataFrame(
+        {
+            "row_index": range(len(frame)),
+            "true_label": labels,
+            "predicted_label": predictions,
+        }
+    )
+    return metrics, prediction_frame
 
 
 def _pad_batch(rows: list[dict[str, Any]], tokenizer: Any) -> dict[str, torch.Tensor]:
