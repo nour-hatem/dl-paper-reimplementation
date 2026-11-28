@@ -81,3 +81,20 @@ This file records every assumption or implementation choice that is **not** expl
 - The paper's development split counts are 482 / 550 / 223, while this project's frozen validation split counts are 462 / 575 / 218. This difference can affect the reported validation metrics.
 - The paper comparison uses the published validation accuracy of 74.98% and weighted F1 of 74.90%. The report gives absolute differences in percentage points. Its rough one-standard-error reference uses the binomial standard error for accuracy at 1,255 validation examples; the same threshold is only a scale reference for weighted F1, which is not binomial.
 - Aggregation reads validation histories only. The notebook does not perform held-out evaluation.
+
+## Phase E: enhancement screening
+
+The following are project decisions for this screening protocol; they are not claims about the paper:
+
+- Each candidate is an independent single-change experiment, initially run with seed 42 for ten epochs using the frozen data, preprocessing, split, batch size, learning rate, optimizer, and maximum sequence length.
+- Mean pooling uses the last hidden state and attention mask: sum only non-padding token states and divide by the count of unmasked tokens (clamped to at least one). It bypasses the BERT pooler. The head is one linear classifier with dropout probability 0.1.
+- Class-weighted cross entropy uses training-split counts only. For class `c`, the weight is `N / (K * n_c)`, where `N` is the training count, `K` is the number of classes, and `n_c` is that class's training count. Weights are not normalized further.
+- Focal loss uses gamma 2.0 by default, no class weights, and the mean of per-example `-(1 - p_t)^gamma * log(p_t)` losses.
+- Layer-wise learning-rate decay uses factor 0.9. The classifier, pooler, and top encoder layer use the configured baseline learning rate. Encoder layer `i` of `L` layers uses `base_lr * 0.9 ** (L - 1 - i)`; embeddings use `base_lr * 0.9 ** L`.
+- The richer head has one 256-unit hidden layer, ReLU activation, dropout probability 0.1 before the hidden layer and after its activation, then a linear three-class output layer.
+- Every newly added linear layer is initialized with a zero bias and normal weights using the encoder's `initializer_range`, matching `BertForSequenceClassification` classifier initialization.
+- A gain smaller than one Phase D best-view standard deviation is marked inconclusive. If the top two candidates are within one such standard deviation on macro F-PN, screening proposes rerunning those two with seeds 43 and 44 and requires approval before that follow-up.
+- A candidate is selected only when the top candidate beats the baseline seed 42 macro F-PN by more than one Phase D best-view standard deviation; otherwise no candidate is selected unless the top-two rule proposes a follow-up for approval.
+- The initial comparison uses one seed and cannot estimate candidate-specific seed variance. Phase D standard deviations provide a noise scale, not a guarantee of significance.
+- GPU runs may not be bit-identical across repetitions because some kernels remain non-deterministic.
+- Only validation histories are read for selection and reporting. The held-out test CSV is never read or referenced.

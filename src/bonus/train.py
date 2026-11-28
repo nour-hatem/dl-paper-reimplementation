@@ -22,7 +22,7 @@ from .evaluate import (
     calculate_metrics,
     evaluate_model_on_csv_with_predictions,
 )
-from .model import build_model
+from .model import build_model, layerwise_parameter_groups
 from .utils import capture_rng_state, restore_rng_state, set_seed
 
 
@@ -256,6 +256,8 @@ def run_training(
     torch.use_deterministic_algorithms(True, warn_only=True)
     tokenizer = AutoTokenizer.from_pretrained(model_cfg["name"])
     train_frame = _read_frame(train_path, max_train_samples)
+    # _read_frame preserves the dataset's integer label IDs; data.py defines
+    # NEG=0, NEU=1, POS=2, matching TextDataset's direct int conversion.
     validation_frame = _read_frame(validation_path, max_validation_samples)
     train_dataset = TextDataset(train_frame, tokenizer, int(train_cfg["max_length"]))
     validation_dataset = TextDataset(validation_frame, tokenizer, int(train_cfg["max_length"]))
@@ -283,15 +285,31 @@ def run_training(
         int(model_cfg["num_labels"]),
         architecture=model_cfg.get("architecture", "sequence_classification"),
         loss=model_cfg.get("loss", "cross_entropy"),
+        model_params=model_cfg.get("params"),
+        loss_params=model_cfg.get("loss_params"),
+        class_counts=(
+            torch.bincount(
+                torch.tensor(train_frame["label"].astype(int).tolist(), dtype=torch.long),
+                minlength=int(model_cfg["num_labels"]),
+            ).tolist()
+            if model_cfg.get("loss") == "class_weighted_ce"
+            else None
+        ),
     )
     model = bundle.model.to(selected_device)
     optimizer_cfg = train_cfg["optimizer"]
     optimizer_name = optimizer_cfg["name"].lower()
     if optimizer_name != "adam":
         raise ValueError("This baseline supports the configured Adam optimizer")
+    learning_rate = float(optimizer_cfg["learning_rate"])
+    decay = train_cfg.get("layerwise_lr_decay")
+    optimizer_parameters = model.parameters()
+    if decay is not None:
+        decay = float(decay)
+        optimizer_parameters = layerwise_parameter_groups(model, learning_rate, decay)
     optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=float(optimizer_cfg["learning_rate"]),
+        optimizer_parameters,
+        lr=learning_rate,
         eps=float(optimizer_cfg["epsilon"]),
         weight_decay=float(optimizer_cfg["weight_decay"]),
     )
@@ -465,6 +483,11 @@ def generate_validation_predictions_from_checkpoint(
         int(model_cfg["num_labels"]),
         architecture=model_cfg.get("architecture", "sequence_classification"),
         loss=model_cfg.get("loss", "cross_entropy"),
+        model_params=model_cfg.get("params"),
+        loss_params=model_cfg.get("loss_params"),
+        # The inference path does not evaluate loss; positive placeholders let
+        # the selected weighted-loss factory be constructed without train data.
+        class_counts=[1] * int(model_cfg["num_labels"]),
     )
     model = bundle.model.to(selected_device)
     checkpoint = _load_checkpoint(checkpoint_path)

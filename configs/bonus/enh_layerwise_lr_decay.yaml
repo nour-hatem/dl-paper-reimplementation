@@ -1,0 +1,29 @@
+# Phase E: layer-wise learning-rate decay only.
+model:
+  name: aubmindlab/bert-base-arabertv02
+  num_labels: 3
+  architecture: sequence_classification
+  loss: cross_entropy
+
+data:
+  train_file: data/splits/arsarcasm_v2/train.csv
+  validation_file: data/splits/arsarcasm_v2/validation.csv
+
+training:
+  seed: 42
+  batch_size: 40
+  max_length: 256
+  epochs: 10
+  mixed_precision: false
+  layerwise_lr_decay: 0.9
+  optimizer:
+    name: Adam
+    learning_rate: 0.00001
+    epsilon: 0.00000001
+    weight_decay: 0.0
+  scheduler: null
+  warmup_steps: 0
+
+paths:
+  output_dir: checkpoints/bonus/enh_layerwise_lr_decay_seed42
+  smoke_output_dir: checkpoints/bonus/repro_arabertv02_base/smoke
