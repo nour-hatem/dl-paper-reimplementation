@@ -70,3 +70,14 @@ This file records every assumption or implementation choice that is **not** expl
 - **Held-out evaluation guard.** Test evaluation is a separate explicit function. It creates an exclusive per-run marker before reading the test CSV and refuses every subsequent attempt for that run directory, even if the first attempt failed partway through. This conservative one-attempt rule is an implementation choice to prevent iterative use of held-out labels.
 - **Run location.** Checkpoints and smoke artifacts are written under the already ignored `checkpoints/` directory. The training interface accepts train and validation CSV paths only; it has no test path setting.
 - **Colab workspace.** The full-run notebook assumes the project folder is in Google Drive at `/content/drive/MyDrive/mizan-arabert-sentiment`; this is a configurable notebook path. Keeping the project and checkpoints in Drive is intended to preserve resume state across Colab runtime interruptions.
+
+## Phase D: three-seed baseline reproduction
+
+- Select each run's best epoch by the highest validation macro F-PN. Exact ties select the earliest epoch, matching the trainer's strict-improvement checkpoint behavior. The last epoch is also reported as a separate secondary view.
+- Across-seed standard deviations use the sample standard deviation (`ddof=1`), for both best-epoch and last-epoch summaries.
+- Seed 42 reuses the pre-snapshot run produced with Phase C code at commit `b981c05`, before the hardening fix. Its provenance is recorded here manually because no `config.json` existed for that run; the Colab notebook verifies a ten-row history with epochs 1 through 10 and both checkpoint files before any new training. Do not create a `config.json` in the seed 42 directory.
+- Seeds 43 and 44 use the current code and receive the trainer's normal `config.json` snapshots. Their output directories are separate so an interrupted run can resume independently.
+- GPU execution is not bit-identical across repeated runs. Seeds and deterministic algorithm settings reduce variation, but GPU kernels can still introduce non-determinism.
+- The paper's development split counts are 482 / 550 / 223, while this project's frozen validation split counts are 462 / 575 / 218. This difference can affect the reported validation metrics.
+- The paper comparison uses the published validation accuracy of 74.98% and weighted F1 of 74.90%. The report gives absolute differences in percentage points. Its rough one-standard-error reference uses the binomial standard error for accuracy at 1,255 validation examples; the same threshold is only a scale reference for weighted F1, which is not binomial.
+- Aggregation reads validation histories only. The notebook does not perform held-out evaluation.
