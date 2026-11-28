@@ -314,6 +314,7 @@ def run_training(
         weight_decay=float(optimizer_cfg["weight_decay"]),
     )
     mixed_precision = bool(train_cfg.get("mixed_precision", False))
+    bundle.loss_fn = bundle.loss_fn.to(selected_device)
     scaler = torch.cuda.amp.GradScaler(enabled=mixed_precision and selected_device.type == "cuda")
 
     start_epoch = 0
